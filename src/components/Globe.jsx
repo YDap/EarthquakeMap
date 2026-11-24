@@ -1,23 +1,27 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
-import { geoOrthographic, geoPath, geoGraticule10, geoDistance } from "d3";
-import { radius, depthColor, isFresh } from "../lib/encoding.js";
+import { geoOrthographic, geoPath, geoGraticule10, geoDistance, geoContains } from "d3";
+import { isFresh } from "../lib/encoding.js";
 import { SPIN_DEG_PER_SEC, RESUME_AFTER_MS } from "../lib/config.js";
 
 const graticule = geoGraticule10();
-
-/**
- * The spinning globe. Everything that changes every frame (rotation, zoom, drag)
- * lives in a ref, NOT React state — re-rendering React 60x/s would be wasteful.
- * React state is only touched when the tooltip changes (via onTip).
- *
- * Props: quakes, land, plates, tip ({ f, x, y, pinned } | null), onTip(tip | null),
- *        refTime (ms, or null = now), freshMs, spin (bool), initialView ({ lon, lat, zoom } | null)
- * Ref API: flyTo(lon, lat), getView() -> { lon, lat, zoom }
- */
 const wrap180 = (a) => ((((a + 180) % 360) + 360) % 360) - 180;
 
+/**
+ * The spinning globe. It knows nothing about earthquakes or storms; each mode hands it:
+ *   points: [{ id, coords:[lon,lat], r, color, time?, pulse?, alpha?, item }]
+ *           r is the radius at zoom 1; `pulse` forces a pulse ring, otherwise
+ *           points with a `time` within `freshMs` of `refTime` pulse.
+ *   lines:  [{ coords:[[lon,lat], ...], color, width? }]
+ *   areas:  [{ id, geometry, fill, stroke, item }]  (GeoJSON geometry; hoverable)
+ *
+ * Everything that changes every frame (rotation, zoom, drag) lives in a ref, NOT React
+ * state: re-rendering React 60x/s would be wasteful. React only hears about hover/click
+ * through onTip({ id, item, x, y, pinned } | null).
+ *
+ * Ref API: flyTo(lon, lat, zoom?), getView() -> { lon, lat, zoom }
+ */
 const Globe = forwardRef(function Globe(
-  { quakes, land, plates, tip, onTip, refTime, freshMs, spin, initialView },
+  { points, lines, areas, land, plates, tip, onTip, refTime, freshMs, spin, initialView },
   ref
 ) {
   const wrapRef = useRef(null);
@@ -29,24 +33,24 @@ const Globe = forwardRef(function Globe(
     rotation: initialView ? [-initialView.lon, -initialView.lat] : [0, -20],
     zoom: initialView?.zoom ?? 1,
     lastInteraction: -Infinity,
-    flyTo: null, // animation target when a list item is clicked
+    flyTo: null, // animation target { rot:[l,p], zoom }
     drag: null,
-    drawn: [], // circles drawn last frame, for hit-testing
+    drawn: [], // points drawn last frame, for hit-testing
+    projection: null,
     W: 0,
     H: 0,
     baseR: 0,
   });
-  Object.assign(s.current, { quakes, land, plates, tip, refTime, freshMs, spin });
+  Object.assign(s.current, { points, lines, areas, land, plates, tip, refTime, freshMs, spin });
 
   useImperativeHandle(
     ref,
     () => ({
-      flyTo(lon, lat) {
+      flyTo(lon, lat, zoom) {
         const st = s.current;
-        // Rotate so the quake sits at the centre, taking the short way round
-        // (the spin keeps adding to rotation[0], so it can be many turns past 360°).
+        // Take the short way round (the spin keeps adding to rotation[0]).
         const r0 = st.rotation[0];
-        st.flyTo = [r0 + wrap180(-lon - r0), -lat];
+        st.flyTo = { rot: [r0 + wrap180(-lon - r0), -lat], zoom: zoom ?? st.zoom };
         st.lastInteraction = Date.now();
       },
       getView() {
@@ -65,6 +69,7 @@ const Globe = forwardRef(function Globe(
     const projection = geoOrthographic().clipAngle(90).precision(0.5);
     const path = geoPath(projection, ctx);
     const st = s.current;
+    st.projection = projection;
 
     function resize() {
       const r = window.devicePixelRatio || 1;
@@ -80,31 +85,31 @@ const Globe = forwardRef(function Globe(
     ro.observe(wrapRef.current);
     resize();
 
-    function visible(f) {
-      // Great-circle distance to the globe's centre; < PI/2 = front hemisphere.
-      const centre = [-st.rotation[0], -st.rotation[1]];
-      return geoDistance(f.geometry.coordinates, centre) < Math.PI / 2;
-    }
-
     let raf;
     let last = performance.now();
     function frame(now) {
       const dt = (now - last) / 1000;
       last = now;
-      const { W, H, rotation, zoom } = st;
+      const { W, H, rotation } = st;
 
       if (st.flyTo) {
-        // smooth move to clicked quake
+        // smooth move (and zoom) to a selected event
         const k = Math.min(1, dt * 4);
-        rotation[0] += (st.flyTo[0] - rotation[0]) * k;
-        rotation[1] += (st.flyTo[1] - rotation[1]) * k;
-        if (Math.abs(st.flyTo[0] - rotation[0]) + Math.abs(st.flyTo[1] - rotation[1]) < 0.2) st.flyTo = null;
+        const [tl, tp] = st.flyTo.rot;
+        rotation[0] += (tl - rotation[0]) * k;
+        rotation[1] += (tp - rotation[1]) * k;
+        st.zoom += (st.flyTo.zoom - st.zoom) * k;
+        const done =
+          Math.abs(tl - rotation[0]) + Math.abs(tp - rotation[1]) < 0.2 && Math.abs(st.flyTo.zoom - st.zoom) < 0.01;
+        if (done) st.flyTo = null;
       } else {
         if (st.spin && Date.now() - st.lastInteraction > RESUME_AFTER_MS && !st.tip?.pinned) {
           rotation[0] += SPIN_DEG_PER_SEC * dt; // the planet never sits still
         }
         if (!st.drag) rotation[0] = wrap180(rotation[0]); // keep the angle small
       }
+      const zoom = st.zoom;
+      const zr = Math.sqrt(zoom);
 
       projection.translate([W / 2, H / 2]).scale(st.baseR * zoom).rotate(rotation);
       ctx.clearRect(0, 0, W, H);
@@ -145,38 +150,63 @@ const Globe = forwardRef(function Globe(
         ctx.stroke();
       }
 
-      // Quakes: big first, so small circles draw on top and stay visible
       const t = now / 1000;
+      const pulsePhase = (t % 1.5) / 1.5;
+      const hoveredId = st.tip?.id;
+
+      // Areas (e.g. tornado warnings): breathing fill so they read as "live"
+      for (const a of st.areas || []) {
+        ctx.beginPath();
+        path(a.geometry);
+        ctx.globalAlpha = 0.35 + 0.25 * Math.sin(t * 3);
+        ctx.fillStyle = a.fill;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = a.id === hoveredId ? "#fff" : a.stroke;
+        ctx.lineWidth = a.id === hoveredId ? 2 : 1.2;
+        ctx.stroke();
+      }
+
+      // Lines (e.g. cyclone tracks)
+      ctx.lineCap = "round";
+      for (const l of st.lines || []) {
+        ctx.beginPath();
+        path({ type: "LineString", coordinates: l.coords });
+        ctx.strokeStyle = l.color;
+        ctx.lineWidth = (l.width ?? 2) * Math.min(zr, 2);
+        ctx.stroke();
+      }
+
+      // Points: big first, so small circles draw on top and stay visible
       const ref = st.refTime ?? Date.now();
+      const centre = [-rotation[0], -rotation[1]];
       const drawn = [];
-      for (const f of st.quakes) {
-        if (!visible(f)) continue;
-        const [x, y] = projection(f.geometry.coordinates);
-        drawn.push({ f, x, y, r: radius(f.properties.mag, zoom) });
+      for (const p of st.points || []) {
+        // Great-circle distance to the globe's centre; < PI/2 = front hemisphere.
+        if (geoDistance(p.coords, centre) >= Math.PI / 2) continue;
+        const [x, y] = projection(p.coords);
+        drawn.push({ p, x, y, r: p.r * zr });
       }
       drawn.sort((a, b) => b.r - a.r);
-      const hovered = st.tip?.f;
-      for (const q of drawn) {
-        const c = depthColor(q.f.geometry.coordinates[2] || 0);
-        if (isFresh(q.f, ref, st.freshMs)) {
-          // pulsing ring for new quakes
-          const p = (t % 1.5) / 1.5;
+      for (const { p, x, y, r } of drawn) {
+        if (p.pulse || (p.pulse !== false && p.time != null && isFresh(p.time, ref, st.freshMs))) {
           ctx.beginPath();
-          ctx.arc(q.x, q.y, q.r + p * q.r * 1.8 + 2, 0, 7);
-          ctx.strokeStyle = c;
-          ctx.globalAlpha = 1 - p;
+          ctx.arc(x, y, r + pulsePhase * r * 1.8 + 2, 0, 7);
+          ctx.strokeStyle = p.color;
+          ctx.globalAlpha = 1 - pulsePhase;
           ctx.lineWidth = 2;
           ctx.stroke();
           ctx.globalAlpha = 1;
         }
         ctx.beginPath();
-        ctx.arc(q.x, q.y, q.r, 0, 7);
-        ctx.fillStyle = c;
-        ctx.globalAlpha = 0.55;
+        ctx.arc(x, y, r, 0, 7);
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.alpha ?? 0.55;
         ctx.fill();
         ctx.globalAlpha = 1;
-        ctx.strokeStyle = q.f === hovered ? "#fff" : c;
-        ctx.lineWidth = q.f === hovered ? 2 : 1;
+        const hov = p.id === hoveredId;
+        ctx.strokeStyle = hov ? "#fff" : p.color;
+        ctx.lineWidth = hov ? 2 : 1;
         ctx.stroke();
       }
       st.drawn = drawn;
@@ -189,6 +219,7 @@ const Globe = forwardRef(function Globe(
       e.preventDefault();
       st.zoom = Math.max(0.6, Math.min(8, st.zoom * Math.exp(-e.deltaY * 0.0015)));
       st.lastInteraction = Date.now();
+      st.flyTo = null;
     }
     canvas.addEventListener("wheel", onWheel, { passive: false });
 
@@ -200,22 +231,29 @@ const Globe = forwardRef(function Globe(
   }, []);
 
   // ---- Pointer interaction ----
+  /** What's under the pointer: the nearest point, else an area containing it. */
   function pick(e) {
-    // nearest drawn circle under the pointer
+    const st = s.current;
     const b = canvasRef.current.getBoundingClientRect();
     const mx = e.clientX - b.left;
     const my = e.clientY - b.top;
     let best = null;
     let bd = Infinity;
-    for (const q of s.current.drawn) {
+    for (const q of st.drawn) {
       const d = Math.hypot(q.x - mx, q.y - my);
       if (d <= Math.max(q.r, 6) && d < bd) {
-        best = q;
+        best = q.p;
         bd = d;
       }
     }
-    return best;
+    if (best || !st.areas?.length || !st.projection) return best;
+
+    const lonlat = st.projection.invert([mx, my]);
+    if (!lonlat || geoDistance(lonlat, [-st.rotation[0], -st.rotation[1]]) >= Math.PI / 2) return null;
+    return st.areas.find((a) => geoContains(a.geometry, lonlat)) || null;
   }
+
+  const tipFor = (hit, e, pinned) => ({ id: hit.id, item: hit.item, x: e.clientX, y: e.clientY, pinned });
 
   const onPointerDown = (e) => {
     const st = s.current;
@@ -234,8 +272,8 @@ const Globe = forwardRef(function Globe(
       st.lastInteraction = Date.now();
       st.flyTo = null;
     } else if (!st.tip?.pinned) {
-      const q = pick(e);
-      if (q) onTip({ f: q.f, x: e.clientX, y: e.clientY, pinned: false });
+      const hit = pick(e);
+      if (hit) onTip(tipFor(hit, e, false));
       else if (st.tip) onTip(null);
     }
   };
@@ -243,8 +281,8 @@ const Globe = forwardRef(function Globe(
   const onPointerUp = (e) => {
     const st = s.current;
     if (st.drag && !st.drag.moved) {
-      const q = pick(e);
-      onTip(q ? { f: q.f, x: e.clientX, y: e.clientY, pinned: true } : null);
+      const hit = pick(e);
+      onTip(hit ? tipFor(hit, e, true) : null);
     }
     st.drag = null;
     st.lastInteraction = Date.now();

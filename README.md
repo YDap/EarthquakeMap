@@ -1,6 +1,9 @@
 # 🌍 Earthquake Live Map
 
-A free, no-API-key React app that pulls recent earthquakes from the USGS public GeoJSON feed and plots them on a slowly spinning 3D globe. Bigger circles = stronger quakes; colour = depth; new quakes (< 1 h) pulse.
+A free, no-API-key React app that plots live natural hazards on a spinning 3D globe. Switch between three tabs:
+- **🌍 Quakes**: USGS earthquakes. Circle size = magnitude, colour = depth, pulsing = under 1 h old.
+- **🌀 Cyclones**: tropical cyclones worldwide (NASA EONET, from JTWC / NOAA NHC). Tracks coloured by Saffir–Simpson category; active storms pulse.
+- **🌪️ Tornadoes**: US tornado reports (NOAA SPC), coloured by EF rating, plus live NWS tornado-warning areas.
 
 ## Run
 ```
@@ -12,10 +15,11 @@ npm run build    # production build into dist/
 The original single-file version is kept in `legacy/index.html`.
 
 ## Structure
-- `src/App.jsx` – wires everything together
-- `src/components/Globe.jsx` – canvas globe, render loop, drag/zoom/hover
+- `src/App.jsx` – wires everything together, owns settings + replay
+- `src/modes/quakes.jsx`, `cyclones.jsx`, `tornadoes.jsx` – one file per tab: fetch data, turn it into globe points/lines/areas, sidebar panel, tooltip
+- `src/components/Globe.jsx` – canvas globe (generic points / lines / areas), render loop, drag/zoom/hover
 - `src/components/Sidebar.jsx`, `Tooltip.jsx`, `Starfield.jsx`
-- `src/hooks/useQuakes.js` – USGS fetch + 60 s polling + countdown
+- `src/hooks/usePolling.js` – fetch + re-poll + countdown, used by every tab
 - `src/hooks/useLand.js` – world outline (bundled from the `world-atlas` package)
 - `src/hooks/usePlates.js`, `useReplay.js`, `useAlerts.js` – plate layer, time slider, new-quake alerts
 - `src/lib/urlState.js` – settings ⇄ URL hash
